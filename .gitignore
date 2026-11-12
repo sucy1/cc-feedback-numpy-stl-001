@@ -15,3 +15,7 @@ cover
 uv.lock
 benchmarks/.cache/
 .python-version
+
+# 本地环境
+.venv/
+tmp/
