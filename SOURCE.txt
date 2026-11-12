@@ -1,0 +1,5 @@
+来源仓库：https://github.com/wolph/numpy-stl
+冻结 commit：e7754b7f6e26f71ae9d3af0c14040fc6cbfc8d19
+许可证：BSD-3-Clause
+导入日期：2026-11-12
+说明：本目录为评测底座，已剥离上游 git 历史，仅保留代码快照。
