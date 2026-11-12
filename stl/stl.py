@@ -79,6 +79,63 @@ MAX_COUNT: float = 1e8
 #: The header format, can be safely monkeypatched. Limited to 80 characters
 HEADER_FORMAT: str = '{package_name} ({version}) {now} {name}'
 
+#: UTF-8 byte order mark, prepended by some Windows exporters
+_UTF8_BOM: bytes = b'\xef\xbb\xbf'
+
+
+class StlFormatError(AssertionError, ValueError):
+    """Raised when a file cannot be parsed as ASCII or binary STL.
+
+    Subclasses :class:`AssertionError` for backwards compatibility
+    (older numpy-stl versions asserted on malformed files) and
+    :class:`ValueError` so it can be caught as a regular value error.
+    """
+
+
+def _scan_ascii_header(header: bytes) -> 'bool | None':
+    """Guess whether ``header`` belongs to an ASCII STL file.
+
+    Skips a UTF-8 BOM, blank lines and ``#`` comment lines before
+    looking for the first meaningful line.
+
+    Returns:
+        True if the first meaningful line starts with ``solid`` or
+        ``facet``, False if the header is clearly not ASCII STL, and
+        None if only a BOM, blank lines and/or comments were found.
+    """
+    if b'\0' in header:
+        return False
+    if header.startswith(_UTF8_BOM):
+        header = header[len(_UTF8_BOM):]
+    for line in header.split(b'\n'):
+        line = line.strip().lower()
+        if not line or line.startswith(b'#'):
+            continue
+        return line.startswith((b'solid', b'facet'))
+    return None
+
+
+def _detect_ascii(fh: IO[Any], header: bytes) -> bool:
+    """Detect whether the stream holds an ASCII STL file.
+
+    Inspects the already-read ``header`` and, when that only contains
+    a BOM, blank lines and/or comments, peeks further into seekable
+    streams so exporters that prepend comment lines (e.g.
+    ``# exported by ...``) are still recognised.
+    """
+    result = _scan_ascii_header(header)
+    if result is None:
+        seekable = getattr(fh, 'seekable', None)
+        if seekable is not None and seekable():
+            try:
+                position = fh.tell()
+                extra = b(fh.read(BUFFER_SIZE))
+                fh.seek(position)
+            except OSError:  # pragma: no cover
+                extra = b''
+            result = _scan_ascii_header(header + extra)
+    return bool(result)
+
 
 def _ensure_seekable(fh: IO[Any], mode: Mode = AUTOMATIC) -> IO[Any]:
     """Return a seekable handle, buffering pipe-like streams fully.
@@ -160,7 +217,7 @@ class BaseStl(base.BaseMesh):
             header = b(header)
 
         if mode is AUTOMATIC:
-            if header.lstrip().lower().startswith(b'solid'):
+            if _detect_ascii(fh, header):
                 try:
                     name, data = cls._load_ascii(fh, header, speedups=speedups)
                 except RuntimeError as exception:
@@ -185,7 +242,20 @@ class BaseStl(base.BaseMesh):
                             fh, header, check_size=True
                         )
             else:
-                name, data = cls._load_binary(fh, header)
+                try:
+                    name, data = cls._load_binary(fh, header)
+                except StlFormatError:
+                    raise
+                except AssertionError as exception:
+                    # A file that is neither ASCII STL nor a plausible
+                    # binary STL used to surface as an absurd triangle
+                    # count. Report what the file actually looks like.
+                    raise StlFormatError(
+                        'Unable to read STL file: not a valid ASCII STL '
+                        '(no "solid" or "facet" section found) and not a '
+                        'valid binary STL (the triangle count in the '
+                        'header is implausible)'
+                    ) from exception
         elif mode is ASCII:
             name, data = cls._load_ascii(fh, header, speedups=speedups)
         elif mode is BINARY:
@@ -229,6 +299,8 @@ class BaseStl(base.BaseMesh):
                 fh.seek(HEADER_SIZE + COUNT_SIZE)
             except OSError:  # pragma: no cover
                 pass
+        else:
+            cls._check_truncated(fh, count)
 
         name = header.strip()
 
@@ -239,6 +311,34 @@ class BaseStl(base.BaseMesh):
             data = np.frombuffer(fh.read(), dtype=cls.dtype, count=count)
             # Copy to make the buffer writable
             return name, data.copy()
+
+    @classmethod
+    def _check_truncated(cls, fh: IO[bytes], count: int) -> None:
+        """Raise a readable error for truncated binary STL data.
+
+        Only fires when at least one full triangle record remains but
+        the data does not match the declared triangle ``count``; short
+        or missing data tails keep the historical lenient behaviour.
+        """
+        itemsize = cls.dtype.itemsize
+        try:
+            position = fh.tell()
+            fh.seek(0, os.SEEK_END)
+            raw_size = fh.tell() - position
+            fh.seek(position)
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            return
+
+        if raw_size < itemsize:
+            return
+
+        expected = count * itemsize
+        if raw_size < expected or raw_size % itemsize:
+            raise StlFormatError(
+                f'Truncated or corrupt binary STL file: the header '
+                f'declares {count} triangles ({expected} bytes of '
+                f'data) but only {raw_size} bytes remain'
+            )
 
     @staticmethod
     def _ascii_reader(  # noqa: C901
@@ -254,13 +354,16 @@ class BaseStl(base.BaseMesh):
             recoverable = [False]
             header += b(fh.read(BUFFER_SIZE))
 
+        # Some Windows exporters prepend a UTF-8 BOM
+        if header.startswith(_UTF8_BOM):
+            header = header[len(_UTF8_BOM):]
+
         lines = b(header).split(b'\n')
 
-        def get(prefix: '_Name' = '') -> 'bytes | list[float]':
-            prefix = b(prefix).lower()
-
-            # Skip blank lines with a loop; recursing per line would
-            # exhaust the stack on files with long blank-line runs.
+        def next_line() -> bytes:
+            # Skip blank and comment ('# ...') lines with a loop;
+            # recursing per line would exhaust the stack on files with
+            # long blank-line runs.
             line = b('')
             raw_line = b('')
             while not line:
@@ -280,20 +383,31 @@ class BaseStl(base.BaseMesh):
 
                 raw_line = raw_line.strip()
                 line = raw_line.lower()
+                if line.startswith(b'#'):
+                    line = b('')
+
+            return raw_line
+
+        def stop_iteration() -> None:
+            # Go back to the beginning of the new solid part
+            size_unprocessedlines = sum(len(line) + 1 for line in lines) - 1
+
+            if size_unprocessedlines > 0:
+                position = fh.tell()
+                fh.seek(position - size_unprocessedlines)
+            raise StopIteration()
+
+        def get(prefix: '_Name' = '') -> 'bytes | list[float]':
+            prefix = b(prefix).lower()
+
+            raw_line = next_line()
+            line = raw_line.lower()
 
             if prefix:
                 if line.startswith(prefix):
                     values = line.replace(prefix, b(''), 1).strip().split()
                 elif line.startswith((b('endsolid'), b('end solid'))):
-                    # go back to the beginning of new solid part
-                    size_unprocessedlines = (
-                        sum(len(line) + 1 for line in lines) - 1
-                    )
-
-                    if size_unprocessedlines > 0:
-                        position = fh.tell()
-                        fh.seek(position - size_unprocessedlines)
-                    raise StopIteration()
+                    stop_iteration()
                 else:
                     raise RuntimeError(
                         recoverable[0],
@@ -309,14 +423,54 @@ class BaseStl(base.BaseMesh):
             else:
                 return b(raw_line)
 
+        def facet_start(raw_line: bytes) -> 'list[float] | None':
+            """Parse the line opening a facet.
+
+            Returns the facet normal, or None when the exporter omitted
+            the ``facet normal`` line (the STL normal is optional) and
+            the facet starts directly with ``outer loop``.
+            """
+            line = b(raw_line).lower()
+            if line.startswith(b('facet normal')):
+                values = (
+                    line.replace(b('facet normal'), b(''), 1).strip().split()
+                )
+                if len(values) != 3:  # pragma: no cover
+                    raise RuntimeError(
+                        recoverable[0], f'Incorrect value {line!r}'
+                    )
+                normals = [float(v) for v in values]
+                if b(get()).lower() != b('outer loop'):
+                    raise RuntimeError(
+                        recoverable[0],
+                        f'{line!r} should be followed by \'outer loop\'',
+                    )
+                return normals
+            elif line == b('outer loop'):
+                return None
+            elif line.startswith((b('endsolid'), b('end solid'))):
+                stop_iteration()
+            else:
+                raise RuntimeError(
+                    recoverable[0],
+                    f'{line!r} should start with {b("facet normal")!r}',
+                )
+
         line = get()
         if not lines:
             raise RuntimeError(
                 recoverable[0], 'No lines found, impossible to read'
             )
 
-        # Yield the name
-        yield cast('bytes', line[5:]).strip()
+        # Yield the name. Files without a 'solid' line (a bare list of
+        # facets) get an empty name; the first line is kept as the start
+        # of the first facet.
+        pending = None
+        if b(line).lower().startswith(b('solid')):
+            yield cast('bytes', b(line)[5:]).strip()
+        else:
+            yield b('')
+            pending = b(line)
 
         while True:
             # Read from the header lines first, until that point we can recover
@@ -326,13 +480,32 @@ class BaseStl(base.BaseMesh):
             # Numpy doesn't support any non-file types so wrapping with a
             # buffer and/or StringIO does not work.
             try:
-                normals = cast('list[float]', get('facet normal'))
-                assert cast('bytes', get()).lower() == b('outer loop')
-                v0 = cast('bytes', get('vertex'))
-                v1 = cast('bytes', get('vertex'))
-                v2 = cast('bytes', get('vertex'))
+                if pending is not None:
+                    normals = facet_start(pending)
+                    pending = None
+                else:
+                    try:
+                        raw_line = next_line()
+                    except RuntimeError as exception:
+                        # A file without 'endsolid' simply ends after
+                        # the last facet; anything else is corruption.
+                        if exception.args[1] == 'Unable to find more lines':
+                            return
+                        raise
+                    normals = facet_start(raw_line)
+                v0 = cast('list[float]', get('vertex'))
+                v1 = cast('list[float]', get('vertex'))
+                v2 = cast('list[float]', get('vertex'))
                 assert cast('bytes', get()).lower() == b('endloop')
                 assert cast('bytes', get()).lower() == b('endfacet')
+                if normals is None:
+                    # The normal is optional in STL; derive it from the
+                    # vertices using the right-hand rule (vertices are
+                    # counter-clockwise when seen from outside), matching
+                    # BaseMesh.update_normals().
+                    normals = np.cross(
+                        np.subtract(v1, v0), np.subtract(v2, v0)
+                    ).tolist()
                 attrs = 0
                 yield (normals, (v0, v1, v2), attrs)
             except AssertionError as e:  # pragma: no cover  # noqa: PERF203
@@ -567,6 +740,9 @@ class BaseStl(base.BaseMesh):
 
         Reads binary or ASCII STL files. Format is
         auto-detected unless ``mode`` is explicitly set.
+        ASCII files containing multiple ``solid`` blocks
+        are merged into a single mesh; use
+        :meth:`from_multi_file` to keep them separate.
 
         Args:
             filename: Path to the STL file.
@@ -603,16 +779,38 @@ class BaseStl(base.BaseMesh):
         """
         mode = Mode(mode)
         if fh:
-            result = cls.load(
-                _ensure_seekable(fh, mode), mode=mode, speedups=speedups
-            )
+            fh = _ensure_seekable(fh, mode)
+            close = False
         else:
-            with open(filename, 'rb') as fh:
-                result = cls.load(fh, mode=mode, speedups=speedups)
+            fh = open(filename, 'rb')  # noqa: SIM115
+            close = True
 
-        if result is None:
-            raise ValueError(f'STL file is empty: {filename}')
-        name, data = result
+        try:
+            result = cls.load(fh, mode=mode, speedups=speedups)
+            if result is None:
+                raise ValueError(f'STL file is empty: {filename}')
+            name, data = result
+
+            # ASCII STL files may contain multiple solids (one per
+            # part); merge all of them into a single mesh. Binary
+            # files hold a single solid, so the next load simply
+            # returns None at EOF. Trailing garbage that does not
+            # parse as a solid is ignored.
+            datas = [data]
+            while True:
+                try:
+                    result = cls.load(fh, mode=ASCII, speedups=speedups)
+                except RuntimeError:
+                    break
+                if result is None:
+                    break
+                datas.append(result[1])
+        finally:
+            if close:
+                fh.close()
+
+        if len(datas) > 1:
+            data = np.concatenate(datas)
 
         # pyrefly: ignore[bad-return]
         return cls(
